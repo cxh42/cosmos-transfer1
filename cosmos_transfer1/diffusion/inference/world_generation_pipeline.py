@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+from collections import defaultdict
 from typing import List, Optional, Union
 
 import cv2
@@ -39,8 +40,10 @@ from cosmos_transfer1.checkpoints import (
     BASE_t2w_7B_SV2MV_CHECKPOINT_AV_SAMPLE_PATH,
     BASE_v2w_7B_SV2MV_CHECKPOINT_AV_SAMPLE_PATH,
     SV2MV_t2w_HDMAP2WORLD_CONTROLNET_7B_CHECKPOINT_PATH,
+    SV2MV_t2w_HDMAP2WORLD_CONTROLNET_7B_WAYMO_CHECKPOINT_PATH,
     SV2MV_t2w_LIDAR2WORLD_CONTROLNET_7B_CHECKPOINT_PATH,
     SV2MV_v2w_HDMAP2WORLD_CONTROLNET_7B_CHECKPOINT_PATH,
+    SV2MV_v2w_HDMAP2WORLD_CONTROLNET_7B_WAYMO_CHECKPOINT_PATH,
     SV2MV_v2w_LIDAR2WORLD_CONTROLNET_7B_CHECKPOINT_PATH,
 )
 from cosmos_transfer1.diffusion.inference.inference_utils import (
@@ -91,6 +94,8 @@ MODEL_NAME_DICT = {
     BASE_v2w_7B_SV2MV_CHECKPOINT_AV_SAMPLE_PATH: "CTRL_7Bv1pt3_sv2mv_v2w_57frames_control_input_hdmap_block3",
     SV2MV_t2w_HDMAP2WORLD_CONTROLNET_7B_CHECKPOINT_PATH: "CTRL_7Bv1pt3_sv2mv_t2w_57frames_control_input_hdmap_block3",
     SV2MV_t2w_LIDAR2WORLD_CONTROLNET_7B_CHECKPOINT_PATH: "CTRL_7Bv1pt3_sv2mv_t2w_57frames_control_input_lidar_block3",
+    SV2MV_t2w_HDMAP2WORLD_CONTROLNET_7B_WAYMO_CHECKPOINT_PATH: "CTRL_7Bv1pt3_sv2mv_t2w_57frames_control_input_hdmap_waymo_block3",
+    SV2MV_v2w_HDMAP2WORLD_CONTROLNET_7B_WAYMO_CHECKPOINT_PATH: "CTRL_7Bv1pt3_sv2mv_v2w_57frames_control_input_hdmap_waymo_block3",
     EDGE2WORLD_CONTROLNET_DISTILLED_CHECKPOINT_PATH: "dev_v2w_ctrl_7bv1pt3_VisControlCanny_video_only_dmd2_fsdp",
 }
 MODEL_CLASS_DICT = {
@@ -110,6 +115,8 @@ MODEL_CLASS_DICT = {
     BASE_v2w_7B_SV2MV_CHECKPOINT_AV_SAMPLE_PATH: MultiVideoDiffusionModelWithCtrl,
     SV2MV_v2w_HDMAP2WORLD_CONTROLNET_7B_CHECKPOINT_PATH: MultiVideoDiffusionModelWithCtrl,
     SV2MV_v2w_LIDAR2WORLD_CONTROLNET_7B_CHECKPOINT_PATH: MultiVideoDiffusionModelWithCtrl,
+    SV2MV_t2w_HDMAP2WORLD_CONTROLNET_7B_WAYMO_CHECKPOINT_PATH: MultiVideoDiffusionModelWithCtrl,
+    SV2MV_v2w_HDMAP2WORLD_CONTROLNET_7B_WAYMO_CHECKPOINT_PATH: MultiVideoDiffusionModelWithCtrl,
     EDGE2WORLD_CONTROLNET_DISTILLED_CHECKPOINT_PATH: VideoDistillModelWithCtrl,
 }
 
@@ -143,6 +150,7 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
         process_group: torch.distributed.ProcessGroup | None = None,
         regional_prompts: List[str] = None,
         region_definitions: Union[List[List[float]], torch.Tensor] = None,
+        waymo_example: bool = False,
     ):
         """Initialize diffusion world generation pipeline.
 
@@ -169,6 +177,7 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
             upsample_prompt: Whether to upsample prompts using prompt upsampler model
             offload_prompt_upsampler: Whether to offload prompt upsampler after use
             process_group: Process group for distributed training
+            waymo_example: Whether to use the waymo example post-training checkpoint
         """
         self.num_input_frames = num_input_frames
         self.control_inputs = control_inputs
@@ -181,7 +190,6 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
         self.upsampler_hint_key = None
         self.hint_details = None
         self.process_group = process_group
-
         self.model_name = MODEL_NAME_DICT[checkpoint_name]
         self.model_class = MODEL_CLASS_DICT[checkpoint_name]
         self.guidance = guidance
@@ -363,7 +371,7 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
     def _load_tokenizer(self):
         load_tokenizer_model(self.model, f"{self.checkpoint_dir}/{COSMOS_TOKENIZER_CHECKPOINT}")
 
-    def _run_tokenizer_decoding(self, sample: torch.Tensor) -> np.ndarray:
+    def _run_tokenizer_decoding(self, sample: torch.Tensor, use_batch: bool = True) -> np.ndarray:
         """Decode latent samples to video frames using the tokenizer decoder.
 
         Args:
@@ -374,35 +382,31 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
                         with values in range [0, 255]
         """
         # Decode video
-        # if sample.shape[0] == 1:
-        #     video = (1.0 + self.model.decode(sample)).clamp(0, 2) / 2  # [B, 3, T, H, W]
-        # else:
-        #     # Do decoding for each batch sequentially to prevent OOM.
-        #     samples = []
-        #     for sample_i in sample:
-        #         samples += [self.model.decode(sample_i.unsqueeze(0)).cpu()]
-        #     samples = (torch.cat(samples) + 1).clamp(0, 2) / 2
+        if sample.shape[0] == 1 or use_batch:
+            video = (1.0 + self.model.decode(sample)).clamp(0, 2) / 2  # [B, 3, T, H, W]
+        else:
+            # Do decoding for each batch sequentially to prevent OOM.
+            samples = []
+            for sample_i in sample:
+                samples += [self.model.decode(sample_i.unsqueeze(0)).cpu()]
+            samples = (torch.cat(samples) + 1).clamp(0, 2) / 2
+            # samples = (torch.stack(samples) + 1).clamp(0, 2) / 2
 
-        #     # Stitch the patches together to form the final video.
-        #     patch_h, patch_w = samples.shape[-2:]
-        #     orig_size = (patch_w, patch_h)
-        #     aspect_ratio = detect_aspect_ratio(orig_size)
-        #     stitch_w, stitch_h = get_upscale_size(orig_size, aspect_ratio, upscale_factor=3)
-        #     n_img_w = (stitch_w - 1) // patch_w + 1
-        #     n_img_h = (stitch_h - 1) // patch_h + 1
-        #     overlap_size_w = overlap_size_h = 0
-        #     if n_img_w > 1:
-        #         overlap_size_w = (n_img_w * patch_w - stitch_w) // (n_img_w - 1)
-        #     if n_img_h > 1:
-        #         overlap_size_h = (n_img_h * patch_h - stitch_h) // (n_img_h - 1)
-        #     from einops import rearrange
-        #     samples = rearrange(samples, "(n t) b ... -> (b n t) ...", n=n_img_h, t=n_img_w)
-        #     video = merge_patches_into_video(samples, overlap_size_h, overlap_size_w, n_img_h, n_img_w)
-        #     video = torch.nn.functional.interpolate(video[0], size=(patch_h * 3, patch_w * 3), mode="bicubic")[None]
-        #     video = video.clamp(0, 1)
-        # video = (video[0].permute(1, 2, 3, 0) * 255).to(torch.uint8).cpu().numpy()
-
-        video = (1.0 + self.model.decode(sample)).clamp(0, 2) / 2  # [B, 3, T, H, W]
+            # Stitch the patches together to form the final video.
+            patch_h, patch_w = samples.shape[-2:]
+            orig_size = (patch_w, patch_h)
+            aspect_ratio = detect_aspect_ratio(orig_size)
+            stitch_w, stitch_h = get_upscale_size(orig_size, aspect_ratio, upscale_factor=3)
+            n_img_w = (stitch_w - 1) // patch_w + 1
+            n_img_h = (stitch_h - 1) // patch_h + 1
+            overlap_size_w = overlap_size_h = 0
+            if n_img_w > 1:
+                overlap_size_w = (n_img_w * patch_w - stitch_w) // (n_img_w - 1)
+            if n_img_h > 1:
+                overlap_size_h = (n_img_h * patch_h - stitch_h) // (n_img_h - 1)
+            video = merge_patches_into_video(samples, overlap_size_h, overlap_size_w, n_img_h, n_img_w)
+            video = torch.nn.functional.interpolate(video[0], size=(patch_h * 3, patch_w * 3), mode="bicubic")[None]
+            video = video.clamp(0, 1)
         video = (video * 255).to(torch.uint8).cpu()
         return video
 
@@ -492,6 +496,7 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
                 compression_factor=self.model.tokenizer.spatial_compression_factor,
             )
 
+        is_upscale_case = any("upscale" in control_inputs for control_inputs in control_inputs_list)
         # Get video batch and state shape
         data_batch, state_shape = get_batched_ctrl_batch(
             model=self.model,
@@ -549,9 +554,18 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
 
             # Prepare x_sigma_max
             if input_video is not None:
-                input_frames = input_video[:, :, start_frame:end_frame].cuda()
-                x0 = self.model.encode(input_frames).contiguous()
-                x_sigma_max = self.model.get_x_from_clean(x0, self.sigma_max, seed=(self.seed + i_clip))
+                if is_upscale_case:
+                    x_sigma_max = []
+                    for b in range(B):
+                        input_frames = input_video[b : b + 1, :, start_frame:end_frame].cuda()
+                        x0 = self.model.encode(input_frames).contiguous()
+                        x_sigma_max.append(self.model.get_x_from_clean(x0, self.sigma_max, seed=(self.seed + i_clip)))
+                    x_sigma_max = torch.cat(x_sigma_max)
+                else:
+                    input_frames = input_video[:, :, start_frame:end_frame].cuda()
+                    x0 = self.model.encode(input_frames).contiguous()
+                    x_sigma_max = self.model.get_x_from_clean(x0, self.sigma_max, seed=(self.seed + i_clip))
+
             else:
                 x_sigma_max = None
 
@@ -584,10 +598,8 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
                 condition_latent = torch.zeros_like(latent_tmp)
             else:
                 num_input_frames = self.num_input_frames
-                prev_frames_patched = split_video_into_patches(
-                    prev_frames, control_input.shape[-2], control_input.shape[-1]
-                )
-                input_frames = prev_frames_patched.bfloat16().cuda() / 255.0 * 2 - 1
+                prev_frames = split_video_into_patches(prev_frames, control_input.shape[-2], control_input.shape[-1])
+                input_frames = prev_frames.bfloat16().cuda() / 255.0 * 2 - 1
                 condition_latent = self.model.encode(input_frames).contiguous()
 
             # Generate video frames for this clip (batched)
@@ -604,10 +616,13 @@ class DiffusionControl2WorldGenerationPipeline(BaseWorldGenerationPipeline):
                 num_input_frames=num_input_frames,
                 sigma_max=self.sigma_max if x_sigma_max is not None else None,
                 x_sigma_max=x_sigma_max,
+                use_batch_processing=False if is_upscale_case else True,
             )
             log.info("Completed diffusion sampling")
             log.info("Starting VAE decode")
-            frames = self._run_tokenizer_decoding(latents)  # [B, T, H, W, C] or similar
+            frames = self._run_tokenizer_decoding(
+                latents, use_batch=False if is_upscale_case else True
+            )  # [B, T, H, W, C] or similar
             log.info("Completed VAE decode")
 
             if i_clip == 0:
@@ -770,11 +785,18 @@ class DiffusionControl2WorldMultiviewGenerationPipeline(DiffusionControl2WorldGe
             np.ndarray: Decoded video frames as uint8 numpy array [T, H, W, C]
                         with values in range [0, 255]
         """
+
+        if self.model.n_views == 5:
+            video_arrangement = [1, 0, 2, 3, 0, 4]
+        elif self.model.n_views == 6:
+            video_arrangement = [1, 0, 2, 4, 3, 5]
+        else:
+            raise ValueError(f"Unsupported number of views: {self.model.n_views}")
         # Decode video
         video = (1.0 + self.model.decode(sample)).clamp(0, 2) / 2  # [B, 3, T, H, W]
         video_segments = einops.rearrange(video, "b c (v t) h w -> b c v t h w", v=self.model.n_views)
         grid_video = torch.stack(
-            [video_segments[:, :, i] for i in [1, 0, 2, 4, 3, 5]],
+            [video_segments[:, :, i] for i in video_arrangement],
             dim=2,
         )
         grid_video = einops.rearrange(grid_video, "b c (h w) t h1 w1 -> b c t (h h1) (w w1)", h=2, w=3)
@@ -902,7 +924,7 @@ class DiffusionControl2WorldMultiviewGenerationPipeline(DiffusionControl2WorldGe
             initial_condition_video = None
 
         data_batch = get_ctrl_batch_mv(
-            self.height, self.width, data_batch, total_T, control_inputs
+            self.height, self.width, data_batch, total_T, control_inputs, self.model.n_views, self.num_video_frames
         )  # multicontrol inputs are concatenated channel wise, [-1,1] range
 
         hint_key = data_batch["hint_key"]
@@ -1112,14 +1134,23 @@ class DiffusionControl2WorldMultiviewGenerationPipeline(DiffusionControl2WorldGe
         Returns:
 
         """
-        base_prompts = [
-            "The video is captured from a camera mounted on a car. The camera is facing forward. ",
-            "The video is captured from a camera mounted on a car. The camera is facing to the left. ",
-            "The video is captured from a camera mounted on a car. The camera is facing to the right. ",
-            "The video is captured from a camera mounted on a car. The camera is facing backwards. ",
-            "The video is captured from a camera mounted on a car. The camera is facing the rear left side. ",
-            "The video is captured from a camera mounted on a car. The camera is facing the rear right side. ",
-        ]
+        if n_views == 5:
+            base_prompts = [
+                "The video is captured from a camera mounted on a car. The camera is facing forward.",
+                "The video is captured from a camera mounted on a car. The camera is facing to the left.",
+                "The video is captured from a camera mounted on a car. The camera is facing to the right.",
+                "The video is captured from a camera mounted on a car. The camera is facing the rear left side.",
+                "The video is captured from a camera mounted on a car. The camera is facing the rear right side.",
+            ]
+        elif n_views == 6:
+            base_prompts = [
+                "The video is captured from a camera mounted on a car. The camera is facing forward.",
+                "The video is captured from a camera mounted on a car. The camera is facing to the left.",
+                "The video is captured from a camera mounted on a car. The camera is facing to the right.",
+                "The video is captured from a camera mounted on a car. The camera is facing backwards.",
+                "The video is captured from a camera mounted on a car. The camera is facing the rear left side.",
+                "The video is captured from a camera mounted on a car. The camera is facing the rear right side.",
+            ]
 
         log.info(f"Reading multiview prompts, found {len(mv_prompts)} splits")
         n = len(mv_prompts)
